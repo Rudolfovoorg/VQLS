@@ -1,0 +1,7 @@
+# Python >= 3.12
+numpy
+scipy
+qiskit
+qiskit-aer
+matplotlib
+ipykernel
