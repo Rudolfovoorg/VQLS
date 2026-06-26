@@ -219,6 +219,6 @@ git push -u origin main
 ---
 
 ## References
-
+- This is a modified version, the original source code is available at: https://github.com/omkarbihani/VQLS
 - C. Bravo-Prieto, R. LaRose, M. Cerezo, Y. Subaşı, L. Cincio, P. J. Coles,
   *Variational Quantum Linear Solver*, arXiv:1909.05820 (2019).
