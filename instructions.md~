@@ -1,0 +1,228 @@
+# Benchmarking VQLS on linear systems from an ADMM Max-Cut solver
+
+## 1. What this study does
+
+VQLS is not applied to Max-Cut. It is applied to *one linear solve* sitting
+inside an iteration of the classical optimizer that solves Max-Cut. The chain:
+
+```
+Max-Cut on G          NP-hard combinatorial problem
+  -> SDP relaxation   max (1/4)<L,X>  s.t.  diag(X) = 1, X >= 0
+  -> ADMM             first-order splitting method
+  -> x-update         a linear system  Q z = b        <-- VQLS goes here
+```
+
+An ADMM run calls that solve hundreds of times. Replacing it with VQLS means
+replacing the *inner* solver, not the optimizer. Any end-to-end claim must
+account for the outer loop.
+
+See `vqls_admm_pipeline.tex` for the diagram.
+
+## 2. The operator
+
+The ADMM `x`-update solves the saddle-point system
+
+```
+Q = [ rho*I   A^T ]        dim = n^2 + n
+    [ A       0   ]
+```
+
+with `A` encoding `diag(X) = 1`. Three properties decide the whole study:
+
+**`Q` is indefinite.** Still Hermitian, so `BaseVQLS` accepts it, but there is
+no SPD structure to exploit and no positive-definite preconditioning story.
+
+**`kappa(Q) = phi^2 ~ 2.618` for every `n`.** With `A A^T = I` the spectrum is
+`{rho}` with multiplicity `n^2 - n`, plus `(rho +- sqrt(rho^2+4))/2`. At
+`rho = 1` that gives `{1, 1.618, -0.618}`. Conditioning is therefore *removed
+as a variable* — unusual, and the main reason this operator is a clean test bed.
+
+**`Q` does not depend on the graph or on the iteration.** Only `b` changes.
+The Pauli decomposition is computed once and reused across every graph and
+every ADMM step. This is the single structural argument in VQLS's favour here,
+since the decomposition is exponential in the qubit count.
+
+Contrast with the IPM Schur operator (`ipm_schur_*.npz`), which is SPD and
+smaller (`dim = n`) but graph-dependent, changes every Newton step, and has
+conditioning that degrades by four orders of magnitude as the method converges.
+Different study; see §7.
+
+## 3. Interface requirements
+
+Three adjustments stand between the ADMM output and `BaseVQLS`.
+
+### 3.1 Dimension padding
+
+`dim(Q) = n^2 + n` is not a power of two (`n=5` gives 30). Pad with an identity
+block:
+
+```
+[ Q  0 ] [ z ]   [ b ]
+[ 0  I ] [ y ] = [ 0 ]
+```
+
+The blocks decouple, so `z` is unchanged. **The RHS padding must be zero** —
+not for correctness of `z` (decoupling already guarantees that) but because
+VQLS returns a *normalized* state. Any nonzero padding component would consume
+amplitude and corrupt `z` after renormalization.
+
+| graph `n` | `dim Q` | padded | qubits `N` |
+|---|---|---|---|
+| 5  | 30  | 32  | 5 |
+| 10 | 110 | 128 | 7 |
+
+Note how fast this grows: 7 qubits buys a 10-node graph.
+
+### 3.2 Normalization of `b`
+
+`BaseVQLS` passes `b` directly to `qiskit.circuit.library.StatePreparation`,
+which rejects a non-unit vector. Normalize and retain `||b||`.
+
+### 3.3 Scale recovery
+
+VQLS returns a unit-norm `|x>` defined up to global phase — it solves for the
+*direction* of `x`. The magnitude is re-fitted classically by least squares:
+
+```
+alpha = <Q x_hat, b> / ||Q x_hat||^2
+```
+
+This is an `O(N^2)` host-side matrix-vector product and is **not** part of the
+quantum routine. State it explicitly in any resource accounting.
+
+## 4. Cost functions
+
+With the LCU decomposition `Q = sum_l a_l P_l`:
+
+```
+Global:  C_G = 1 - |<b|psi>|^2 / <psi|psi>
+
+Local:   C_L = 1/2 - (1/2N) * sum_j <psi| B Z_j B^dag |psi> / <psi|psi>
+```
+
+where `|psi> = Q|x(theta)>` and `B|0> = |b>`. Both reach 0 at the solution.
+
+**They are not numerically comparable.** At identical parameters they return
+different values because they are different objectives descending different
+landscapes. A smaller `final_cost` under `C_L` does not mean a better answer
+than a larger one under `C_G`. Compare recovered-solution metrics only.
+
+`C_L` exists to mitigate barren plateaus, which appear at large qubit counts
+with random initialization. At `N <= 7` that regime is not reached, so `C_L`
+carries its overhead without delivering its benefit — expect `C_G` to match or
+win at these sizes, and do not generalize that finding upward.
+
+## 5. Benchmark metrics
+
+### 5.1 Report these two, always together
+
+| metric | definition | fails when |
+|---|---|---|
+| residual | `\|Qx - b\| / \|b\|` | `kappa` large — small residual with large error |
+| fidelity | `\|<x_exact\|x_hat>\|^2` | near the optimum — quadratic, saturates at 1.0000 |
+
+Neither is safe alone. The error bound is
+
+```
+||x - x*|| / ||x*||  <=  kappa(Q) * residual
+```
+
+so at `kappa = 4.2e3` a residual of `1.7e-2` bounds the error by ~72 — no
+information. A measured case from `ipm_schur_n32` iteration 5: residual
+`1.73e-2` (the best in the sweep) alongside fidelity `0.0887` (useless). The
+residual was flattering a near-random answer.
+
+For the ADMM operator `kappa = 2.618`, so residual is trustworthy here — but
+report fidelity anyway so the comparison against IPM stays meaningful.
+
+### 5.2 Report these as run conditions
+
+| parameter | why it matters |
+|---|---|
+| ansatz depth `d` | the binding constraint at fixed `kappa`; see §6 |
+| parameter count | `2Nd` for `HE_ansatz`, `Nd` for `fixed_ansatz` |
+| `maxiter` | COBYLA budget; check whether it was exhausted |
+| cost evaluations | if `== maxiter`, the run did not converge |
+| seeds | **>= 10**; a single seed cannot separate `C_G` from `C_L` |
+| `kappa(Q)` | the other axis of accuracy |
+| `L` (Pauli terms) | measurement cost driver |
+| `num_shots` | Sampler variants only |
+
+Report seed spread as median `[min, max]`, never a single run.
+
+### 5.3 Resource counters
+
+For the shot-based Sampler solvers, the Hadamard-test loop costs
+
+```
+circuits per cost evaluation  =  N * L^2  +  L(L+1)/2
+```
+
+which is the honest measurement-overhead figure. Measured for dense random `A`:
+
+| `N` | `L` | circuits / cost eval |
+|---|---|---|
+| 2 | 10  | 255 |
+| 3 | 36  | 4,554 |
+| 4 | 136 | 83,300 |
+| 5 | 528 | 1,533,576 |
+
+At 4096 shots each, `N=5` is ~6e9 shots per cost evaluation. Quote this; it is
+the number that decides whether the method is deployable.
+
+## 6. Known failure modes
+
+**Ansatz expressibility is the binding constraint, not conditioning.** On the
+ADMM operator (`kappa = 2.618`, about as good as it gets), `d=2` yields fidelity
+~0.50 on a 32-dimensional space — no better than noise. Raising to `d=8` gives
+~0.96. Parameter count `2Nd` grows linearly in `N` while the Hilbert space grows
+exponentially, so depth must scale with `N`. Sweeping `d` at fixed `kappa` is
+the cleanest experiment this operator supports.
+
+**Sparsity in `A` does not save you if `b` is dense.** The Estimator solvers
+build operator products in Pauli space. A dense `b` makes `StatePreparation`
+generic, so `B_LCU` has all `4^N` terms — 1024 at `N=5`. The local cost then
+assembles `A^dag B Z_j B^dag A` with `112^2 * 1024^2 ~ 1.3e10` terms before
+simplification, and the global cost assembles `B^dag A V` with ~`1e8` terms,
+rebuilt every cost evaluation. Both exhaust memory at `N=5`.
+
+`SDPSystem.for_vqls()` supplies `A_LCU` but not `B_LCU`, so the shipped escape
+hatch closes only half the door.
+
+*Mitigation:* the Estimator path is an exact statevector simulation, so these
+quantities can be computed with dense linear algebra at no loss of fidelity to
+the model — `M = B^dag Q V` is a `2^N x 2^N` product. `fast_exact.py`
+implements this and agrees with `vqls.py` to 5.6e-17.
+
+**Padding must not leak into the RHS.** See §3.1.
+
+## 7. Suggested experiments
+
+1. **Depth sweep** — `d` in `{2,4,6,8,10,12}`, ADMM operator, >=5 seeds.
+   Isolates expressibility at fixed conditioning. Primary result.
+2. **Cost comparison** — `C_G` vs `C_L`, >=10 seeds, at the depth where the
+   solver actually works. Below that depth the comparison is meaningless.
+3. **Conditioning sweep** — IPM operator only, `kappa` from 1.16 to 4.2e3 at
+   fixed qubit count. The ADMM family cannot support this (`kappa` is constant),
+   and it is the sharpest available demonstration of where VQLS breaks.
+4. **Shot noise** — Sampler variants at `N<=3`, several `num_shots` values.
+   Report circuits per evaluation alongside accuracy.
+
+## 8. Scope
+
+Simulation and proof-of-concept only. `get_LCU` and `Operator(circuit)` scale
+exponentially in `N`; the shipped systems reach 7 qubits. Scale recovery is
+classical. VQLS has no proven advantage over classical linear solvers for these
+systems, and this study does not claim one — it characterizes where the method
+fails on operators a real optimizer actually produces.
+
+All shipped systems use one graph (`p = 0.5`, `seed = 1`, `rho = 1`). For the
+IPM family the graph affects the operator; for the ADMM family it provably does
+not.
+
+## 9. References
+
+- C. Bravo-Prieto, R. LaRose, M. Cerezo, Y. Subasi, L. Cincio, P. J. Coles,
+  *Variational Quantum Linear Solver*, arXiv:1909.05820 (2019).
+- Operators exported from
+  https://github.com/Rudolfovoorg/Quantum-resource-analysis
